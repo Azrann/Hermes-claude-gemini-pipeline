@@ -12,10 +12,14 @@ build/
 *.key
 *.pem
 
+# Notifier config (contains real API keys)
+notifier.env
+.config/
+
 # Pipeline runtime artifacts (feature dirs)
 features/*/
 *.hermes/
-.hermes/
+.heroku/
 
 # Logs
 *.log
