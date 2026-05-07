@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Secrets
+*.env
+.env*
+*.key
+*.pem
+
+# Pipeline runtime artifacts (feature dirs)
+features/*/
+*.hermes/
+.hermes/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
