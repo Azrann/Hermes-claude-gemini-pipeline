@@ -4,9 +4,11 @@ Pipeline Notifier — Level 2
 Pattern-matching + LLM enrichment for pipeline events.
 
 Tails status.log and sends real-time notifications via Telegram.
-Configuration is read from ~/.config/pipeline/notifier.env (mode 0600).
+Configuration defaults to ~/.hermes/notifier.env (mode 0600).
+Override with --env-path and --error-log.
 """
 
+import argparse
 import http.client
 import json
 import os
@@ -16,10 +18,11 @@ import time
 from pathlib import Path
 
 # ═════════════════════════════════════════════════════════════════════════════
-# config
+# config (overridden by CLI --env-path and --error-log; see main())
 
-ENV_PATH = Path.home() / ".config" / "pipeline" / "notifier.env"
-ERROR_LOG = Path.home() / ".config" / "pipeline" / "notifier-errors.log"
+ENV_PATH = Path.home() / ".hermes" / "notifier.env"
+ERROR_LOG = Path.home() / ".hermes" / "notifier-errors.log"
+_current_error_log = ERROR_LOG  # overridden by --error-log
 
 NO_ACTIVITY_TIMEOUT_SEC = 60 * 60  # 60 minutes
 SLEEP_INTERVAL_SEC = 1.0
@@ -138,40 +141,24 @@ def extract_slug(feature_dir: Path) -> str:
 # 4. classify_event
 
 def classify_event(line: str) -> tuple | None:
-    """Return ('rich', event_type) for reviewer summary events, None for everything else.
+    """Return event_type for reviewer summary events, None for everything else.
     Pipeline now emits all phase-transition notifications directly."""
     if "[Reviewer plan review end]" in line:
-        return ("rich", "reviewer_plan_complete")
+        return "reviewer_plan_complete"
     if "[Reviewer code review end]" in line:
-        return ("rich", "reviewer_code_complete")
+        return "reviewer_code_complete"
+    if "phase=ERROR" in line:
+        return "error"
+    if "phase=ESCALATE" in line:
+        return "escalate"
+    if "phase=DONE" in line:
+        return "done"
     return None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 5. extract_simple_message
 
-def _extract_round(line: str, key: str) -> int | None:
-    if key not in ("builder_plan_revise", "builder_fix"):
-        return None
-    m = re.search(r'round\s+(\d+)', line, re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-    return None
-
-
-def extract_simple_message(key: str, slug: str, line: str = "") -> str:
-    round_num = _extract_round(line, key)
-    messages = {
-        "hermes_init": f"🚀 Pipeline iniciado: {slug}",
-        "builder_plan_starting": "🧠 Builder planificando (Opus)...",
-        "reviewer_plan_review": "🔍 Revisando plan (Gemini)...",
-        "builder_plan_revise": f"✏️ Revisando plan (round {round_num})" if round_num else "✏️ Revisando plan",
-        "builder_exec": "🛠 Ejecutando código (Sonnet)...",
-        "reviewer_code_review": "🔍 Revisando código (Gemini)...",
-        "builder_fix": f"🔧 Aplicando fixes (round {round_num})" if round_num else "🔧 Aplicando fixes",
-        "merge_ready": "✅ Listo para merge",
-    }
-    return messages.get(key, line)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 6. extract_rich_context
@@ -332,11 +319,13 @@ def _openrouter_request(config: dict, messages: list) -> str | None:
         "temperature": LLM_TEMPERATURE,
     })
 
+    http_referer = config.get("HTTP_REFERER", "https://github.com")
+    x_title = config.get("X_TITLE", "Pipeline Notifier")
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com",
-        "X-Title": "Pipeline Notifier",
+        "HTTP-Referer": http_referer,
+        "X-Title": x_title,
     }
 
     def _do_request():
@@ -465,22 +454,30 @@ def send_telegram(text: str, config: dict) -> bool:
 # ═════════════════════════════════════════════════════════════════════════════
 # 10. log_error
 
+# ERROR_LOG is set by main() via the --error-log arg
 def log_error(msg: str) -> None:
     ts = time.strftime("%Y-%m-%dT%H:%M:%S")
-    with open(ERROR_LOG, "a", encoding="utf-8") as f:
+    with open(_current_error_log, "a", encoding="utf-8") as f:
         f.write(f"[{ts}] {msg}\n")
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 11. main
 
-def main(feature_dir: str) -> int:
-    feature_dir_path = Path(feature_dir).resolve()
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Pipeline Notifier — tails status.log and sends Telegram notifications")
+    parser.add_argument("feature_dir", help="Path to the feature directory")
+    parser.add_argument("--env-path", default=str(ENV_PATH), help="Path to notifier.env (default: ~/.hermes/notifier.env)")
+    parser.add_argument("--error-log", default=str(ERROR_LOG), help="Path to error log (default: ~/.hermes/notifier-errors.log)")
+    args = parser.parse_args()
+
+    feature_dir_path = Path(args.feature_dir).resolve()
     if not feature_dir_path.exists():
-        print(f"ERROR: Feature dir does not exist: {feature_dir}", file=sys.stderr)
+        print(f"ERROR: Feature dir does not exist: {args.feature_dir}", file=sys.stderr)
         return 1
 
+    env_path = Path(args.env_path)
     try:
-        config = load_config(ENV_PATH)
+        config = load_config(env_path)
     except Exception as e:
         print(f"ERROR loading config: {e}", file=sys.stderr)
         return 1
@@ -507,13 +504,9 @@ def main(feature_dir: str) -> int:
         if classification is None:
             continue
 
-        kind, key = classification
+        key = classification
 
-        if kind == "simple":
-            message = extract_simple_message(key, slug, line)
-            prefixed = f"[{slug}] {message}"
-            send_telegram(prefixed, config)
-        elif kind == "rich":
+        if key in ("reviewer_plan_complete", "reviewer_code_complete", "error", "escalate", "done"):
             event_index = 0
             if key in event_counts:
                 event_index = event_counts[key]
@@ -547,7 +540,4 @@ def main(feature_dir: str) -> int:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: notifier.py <feature_dir>", file=sys.stderr)
-        sys.exit(1)
-    sys.exit(main(sys.argv[1]))
+    sys.exit(main())

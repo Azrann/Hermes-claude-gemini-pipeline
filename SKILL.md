@@ -337,7 +337,7 @@ One feature, one directory. Keep them around as a build archive — they're the 
 
 ## Notifier configuration
 
-The notifier reads `~/.config/pipeline/notifier.env` (mode 0600):
+The notifier reads `~/.hermes/notifier.env` (mode 0600). Override with `--env-path`:
 
 ```
 TELEGRAM_BOT_TOKEN_NOTIFICATIONS=<bot-token>
@@ -345,7 +345,9 @@ TELEGRAM_CHAT_ID_NOTIFICATIONS=<chat-id>
 OPENROUTER_API_KEY=<api-key>
 ```
 
-Note: the orchestrator itself sends phase-transition notifications via a separate `notify_telegram()` helper that reads `~/.hermes/notifier.env`. **These are two senders with two config files.** If you only configure one, you'll get partial notifications. Either symlink them or maintain both.
+Optional: set `HTTP_REFERER` and `X_TITLE` if you want OpenRouter analytics to show your project name instead of the generic defaults.
+
+Note: the orchestrator itself sends phase-transition notifications via a separate `notify_telegram()` helper that reads from the *same* `~/.hermes/notifier.env` by default. Both senders point to the same file — no symlinks needed.
 
 ---
 

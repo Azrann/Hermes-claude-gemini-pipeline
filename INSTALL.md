@@ -116,31 +116,38 @@ The notifier uses OpenRouter (Llama 3 8B by default) to generate Spanish summari
 
 ### 4c. Write the config files
 
-Two files, two paths. The orchestrator reads `~/.hermes/notifier.env` for phase notifications; the notifier child process reads `~/.config/pipeline/notifier.env` for review summaries.
+Two files, one path. The orchestrator reads `~/.hermes/notifier.env` for phase notifications; the notifier child process reads the same file via the `--env-path` default.
 
-Create both with mode `0600`:
+Create it with mode `0600`:
 
 ```bash
-mkdir -p ~/.hermes ~/.config/pipeline
+mkdir -p ~/.hermes
 
-cat > ~/.config/pipeline/notifier.env <<'EOF'
+cat > ~/.hermes/notifier.env <<'EOF'
 TELEGRAM_BOT_TOKEN_NOTIFICATIONS=7891234567:AAH...your-token...
 TELEGRAM_CHAT_ID_NOTIFICATIONS=123456789
 OPENROUTER_API_KEY=sk-or-v1-...your-key...
 EOF
 
-chmod 600 ~/.config/pipeline/notifier.env
-
-# The orchestrator reads from ~/.hermes/notifier.env. Symlink to keep them in sync:
-ln -s ~/.config/pipeline/notifier.env ~/.hermes/notifier.env
+chmod 600 ~/.hermes/notifier.env
 ```
 
-The notifier hard-fails if the file isn't `0600` — this is intentional, the file holds three credentials.
+Optional: add `HTTP_REFERER` and `X_TITLE` if you want OpenRouter analytics to identify your project instead of the generic defaults:
+
+```bash
+cat >> ~/.hermes/notifier.env <<'EOF'
+HTTP_REFERER=https://github.com/you/your-repo
+X_TITLE=Hermes Pipeline Notifier
+EOF
+chmod 600 ~/.hermes/notifier.env
+```
+
+The notifier hard-fails if the file isn't `0600` — this is intentional, the file holds credentials.
 
 Verify by sending a test message:
 
 ```bash
-source ~/.config/pipeline/notifier.env
+source ~/.hermes/notifier.env
 curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN_NOTIFICATIONS}/sendMessage" \
   -d "chat_id=${TELEGRAM_CHAT_ID_NOTIFICATIONS}" \
   -d "text=pipeline notifier test"
@@ -260,7 +267,7 @@ Most common cause: `claude` or `gemini` is unauthenticated and the subprocess is
 
 ### Telegram test message arrives but pipeline notifications don't
 
-You configured one of the two notifier env files but not the other (or the symlink). The orchestrator and the notifier child process read different paths — see section 4c. `ls -la ~/.hermes/notifier.env ~/.config/pipeline/notifier.env` should show both pointing to a real file with mode `0600`.
+You configured the notifier env file incorrectly (wrong path, wrong permissions, or wrong key names). The notifier reads `~/.hermes/notifier.env` by default; you can override with `--env-path`. Run `ls -la ~/.hermes/notifier.env` — it should be a real file with mode `0600` containing the three required keys.
 
 ### `protocol violation: ...` errors on real runs
 
