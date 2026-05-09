@@ -1,45 +1,58 @@
 ---
 name: claude-gemini-pipeline
-description: "Drive a feature build through a Claude (Builder) and Gemini (Reviewer) collaboration. Use when asked to 'build and review a feature', 'run the multi-agent pipeline', or for Claude-to-build / Gemini-to-review workflows. The orchestrator handles plan, plan-review, execute, code-review, and merge-readiness."
+description: Drive a feature build through a Builder (Claude Code) + Reviewer (Gemini CLI) collaboration. Use when asked to "build and review a feature," "run the multi-agent pipeline," or any phrasing that combines feature implementation with cross-model code review. The orchestrator handles plan, plan-review, execute, code-review, and merge-readiness as a deterministic Python state machine. The pipeline runs detached for 5–15 minutes; after launching it, end the turn and let the user drive — do not poll, tail, or wait in-conversation.
 ---
 
 # Claude-Gemini Pipeline (v2.2)
 
-## What this does
+## When to use
 
-A two-agent build/review pipeline:
+Use this skill when the user asks to "build and review a feature," "have Claude implement and Gemini review X," "run the multi-agent pipeline," or any phrasing that combines **feature implementation** with **cross-model code review**.
 
-1. **Setup** — `pipeline.py setup` creates a feature directory with session UUIDs, seeds `conversation.md`, and prepares `state.json` / `status.log`.
-2. **Run** — `pipeline.py run <feature_dir>` is a pure Python state machine that drives Claude (Builder: Opus for plan, Sonnet for exec) and Gemini (Reviewer) through the build/review loop until DONE, ESCALATE, or ERROR.
-3. **Report** — read `result.json` and `findings.json` to surface the outcome.
+**Do NOT use** for:
 
-The orchestrator uses only the Python standard library and runs to completion as a child process. The caller does not need to stay in the loop while it runs.
+- Simple one-off code edits the user wants you to do directly.
+- Baseline scaffolding (initialising a repo, setting up a project, first deploy). If a request mixes scaffolding and feature work, do scaffolding manually first, then enter the pipeline for the feature.
+- Research or investigation tasks that don't end in a committed feature branch.
 
-## Trigger
-
-Use this when the user asks to "build and review a feature," "run the multi-agent pipeline," "have Claude implement and Gemini review X," or any phrasing that combines feature implementation with cross-model code review.
-
-Do NOT use for: simple one-off code edits, baseline scaffolding, or research/investigation tasks that don't end in a merged feature.
+When the user reports a bug or asks for a code fix in a real project, **propose the pipeline first and wait for confirmation** rather than editing files directly.
 
 ## Prerequisites
 
-The orchestrator validates these at runtime, but sanity-check before launching:
+The orchestrator validates these at runtime via `verify_prerequisites()`. Sanity-check before launching:
 
-- `claude` CLI installed and authenticated (Claude Code v2.1.x or newer).
-- `gemini` CLI installed and authenticated (Gemini CLI v0.40 or newer).
-- `git` and `gh` available; the project is a git repository.
-- Python 3.10+ (only stdlib used).
-- The user is on a branch where it's safe to commit (orchestrator creates `feature/<slug>` automatically).
+- `claude` CLI installed and logged in (`claude login` already done; Claude Code v2.1.x or newer).
+- `gemini` CLI installed and logged in (`gemini` then `/auth` already done; Gemini CLI v0.40+).
+- `git` available and `project_root` is a git repo.
+- **Working tree is clean** — `git status --porcelain` must be empty. The orchestrator hard-fails otherwise. This is the most common reason setup is rejected.
+- Python 3.10+ (stdlib only).
+- Current branch is one where it's safe to commit. The orchestrator will create `feature/<slug>` automatically.
 
-If any are missing, tell the user what to install rather than launching and watching failure.
+If any are missing, tell the user what to install instead of launching and watching it fail.
 
-## Step 0 — Scope validation
+---
 
-Separate baseline scaffolding (initializing a repo, setting up a project, creating the GitHub repo, first deploy) from feature development (adding a contact form, fixing a bug, refactoring a module). The pipeline is for feature development. If the request mixes both, handle scaffolding separately first, then enter the pipeline for the feature.
+## Step 0 — Mock mode first (on a fresh machine or after edits)
+
+Mock mode replaces both CLIs with canned fakes. Zero tokens, ~1s wall-clock, exercises the whole state machine including a CHANGES_REQUESTED → APPROVED loop. Run it whenever:
+
+- This is the first time the pipeline runs on a new machine.
+- You've edited `pipeline.py`, the prompts, or the validation logic.
+- You're debugging a protocol violation and want to confirm the harness still works.
+
+```bash
+mkdir -p /tmp/pipeline-mock-test && cd /tmp/pipeline-mock-test && git init -q && git commit --allow-empty -m init -q
+python3 pipeline.py setup --slug mock-test --request "Test" --project-root /tmp/pipeline-mock-test
+FEATURE_DIR=$(ls -d /tmp/pipeline-mock-test/.hermes/features/mock-test-* | head -1)
+python3 pipeline.py run "$FEATURE_DIR" --mock
+# → must end in DONE
+```
+
+Note the path: features live under `.hermes/features/`, **not** `.features/`.
+
+---
 
 ## Step 1 — Setup
-
-Run:
 
 ```bash
 python3 pipeline.py setup \
@@ -48,44 +61,70 @@ python3 pipeline.py setup \
   --project-root <absolute path to git repo>
 ```
 
-Optional flags:
+Useful flags:
 
-- `--request-file <path>` — use a file instead of inline text for longer briefs.
-- `--branch feature/custom-name` — override the default `feature/<slug>` branch.
-- `--builder-plan-model opus` / `--builder-exec-model sonnet` — defaults; override if asked.
-- `--builder-max-turns 120` — per-invocation tool-call cap for the Builder. Default 120.
+- `--request-file <path>` — file instead of inline text for longer briefs.
+- `--branch feature/custom-name` — override default `feature/<slug>`.
+- `--builder-plan-model opus` / `--builder-exec-model sonnet` — defaults; override if asked or for budget mode (see Active Gotchas).
+- `--builder-max-turns 120` — Builder per-invocation tool-call cap. Default 120.
 - `--plan-review-cap 2` / `--code-review-cap 2` — round caps before escalation.
 
-Setup prints the absolute feature directory path on stdout.
+Setup prints the absolute feature directory path on stdout — capture it.
 
-## Step 2 — Run
+## Step 2 — Run, then hand off
+
+The orchestrator **auto-launches the notifier** as a child process. Do not launch `notifier.py` manually — that produces two notifiers racing on the same `status.log`. If you want notifications off, pass `--no-notifier`.
 
 ```bash
-# Create log directory
-mkdir -p ~/.config/pipeline/logs
+# Detach from the parent shell so the pipeline survives terminal closure.
+mkdir -p ~/.hermes/logs
 
-# Launch pipeline detached from parent shell
 setsid python3 pipeline.py run "$FEATURE_DIR" \
     </dev/null \
-    >>~/.config/pipeline/logs/pipeline-$(basename "$FEATURE_DIR").log 2>&1 &
+    >>~/.hermes/logs/pipeline-$(basename "$FEATURE_DIR").log 2>&1 &
 PIPELINE_PID=$!
-
-# Launch notifier (optional) detached from parent shell
-setsid python3 notifier.py "$FEATURE_DIR" \
-    </dev/null \
-    >>~/.config/pipeline/logs/notifier-$(basename "$FEATURE_DIR").log 2>&1 &
-NOTIFIER_PID=$!
-
-echo "Pipeline PID: $PIPELINE_PID, Notifier PID: $NOTIFIER_PID"
+echo "Pipeline PID: $PIPELINE_PID"
 ```
 
-- `setsid` detaches from the parent shell.
-- `</dev/null` closes stdin.
-- `>>logs/...` redirects stdout/stderr.
+`setsid` detaches from the parent. `</dev/null` closes stdin (avoids the 3s "no stdin data received" stall). The redirect captures stdout/stderr.
 
-Typical wall-clock time: 5–15 minutes. Do not interfere while running — locking is advisory and concurrent agents create race conditions.
+Typical wall-clock: 5–15 minutes. **Do not interfere while running** — the file lock is advisory and concurrent agents race on git operations.
 
-For progress visibility: `tail -f <feature_dir>/status.log` or `tail -f ~/.config/pipeline/logs/pipeline-<name>.log`.
+### Hand the run off to the user — do not wait for it
+
+Once the pipeline is launched and detached, **end your turn**. Do not poll `result.json`, do not `tail -f`, do not loop on `pipeline.py status`. The pipeline runs independently as a detached process; sitting in-conversation watching it burns context for no benefit and the user gets no information they don't already have on Telegram.
+
+End the turn with a short handoff message that includes:
+
+- The feature directory path (so the user can copy it back later).
+- The PID (so the user can check or kill it).
+- That progress notifications will arrive on Telegram.
+- That the user should **come back and ask** when they want the report — at that point you'll run Step 3.
+
+Example handoff:
+
+> Pipeline launched for `<slug>` (PID `<pid>`). Feature directory: `<feature_dir>`. You'll see progress on Telegram as it runs through plan → review → exec → review. Typical wall-clock is 5–15 minutes. **Come back and tell me when you want the report** (or if Telegram shows ESCALATE / ERROR before then) and I'll pick it up from `result.json`.
+
+Then stop. Do not add a "I'll check back in N minutes" — there is no N; the user drives.
+
+### When the user returns
+
+When the user comes back saying "it's done" / "check the result" / "what happened" / etc., proceed to Step 3. First confirm the pipeline actually finished:
+
+```bash
+test -f "$FEATURE_DIR/result.json" && echo "complete" || echo "still running"
+```
+
+- **`result.json` exists** → run Step 3.
+- **`result.json` doesn't exist** → pipeline is still running. Show a snapshot and tell the user to come back later:
+
+  ```bash
+  python3 pipeline.py status "$FEATURE_DIR"
+  ```
+
+  Report the current phase and round counters from the snapshot, then end the turn again. Do not start polling.
+
+If the user asks for live progress mid-run rather than a final report, run `pipeline.py status` once, report what it shows, and end the turn. They have Telegram for the streaming view; you give them point-in-time snapshots on request.
 
 ## Step 3 — Report
 
@@ -105,21 +144,13 @@ When the script exits, read `<feature_dir>/result.json`:
 
 Branch on `final_status`:
 
-- **`DONE`** — feature is on the branch, code-reviewed and approved. Report the branch name, summarise changes from the latest `[Builder]` block in `conversation.md`, and offer to push/create PR. Do NOT auto-merge.
-
-- **`ESCALATE`** — hit a round cap or agent asked for input. Read `findings.json` and the latest `[Reviewer]` block in `conversation.md` to surface BLOCKERs. Offer to: (a) increase round cap and resume, (b) hand off the half-built branch for manual fixing, or (c) abort and clean up.
-
-- **`ERROR`** — protocol or subprocess failure. The `final_reason` field says what. Common cases:
-  - `builder/reviewer subprocess failed: rc=...` — CLI error. Check auth, model availability, network, quota.
-  - `reviewer subprocess failed: rc=-1 timed_out=True` — Gemini timed out before end-marker. Check `conversation.md` — the review may be complete there.
-  - `protocol violation: end-marker missing` — agent didn't write sentinel to `status.log`.
-  - `protocol violation: no VERDICT line` — agent wrote a block but forgot the verdict.
-
-Preserve the feature directory as a debugging artifact. Do not delete without user confirmation.
+- **DONE** — feature is on the branch, code-reviewed and approved. Report the branch name, summarise changes from the latest `[Builder]` block in `conversation.md`, and offer to push / open a PR. **Do not auto-merge.**
+- **ESCALATE** — hit a round cap or an agent asked for input. **Not a failure** — human input required. Read `findings.json` and the latest `[Reviewer]` block. Offer: (a) raise the round cap and resume, (b) hand off the half-built branch, or (c) abort and clean up.
+- **ERROR** — protocol or subprocess failure. `final_reason` says what. See the Recovery Playbook below.
 
 ## Step 4 — Merge (human-driven)
 
-The pipeline does NOT auto-merge. After DONE, optionally:
+The pipeline does **not** auto-merge. After DONE, optionally:
 
 ```bash
 cd <project_root>
@@ -128,226 +159,185 @@ gh pr create --head <branch_name> --base main --title "..." --body "..."
 gh pr merge --merge --delete-branch
 ```
 
-Build the PR body from the latest `[Builder]` block plus a "Reviewed by Gemini" line. Do this only after user confirmation.
+Build the PR body from the latest `[Builder]` block plus a "Reviewed by Gemini" line. Do this only after user confirmation. Then offer to clean up the feature directory.
 
-After successful merge, offer to clean up the feature directory.
+After DONE, also verify TypeScript yourself if applicable: `npx tsc --noEmit`. Don't trust "TSC OK" claims from the Builder.
 
-## Configuration knobs
+---
 
-- **Models** — Builder defaults Opus (plan) / Sonnet (exec). Override with `--builder-plan-model` / `--builder-exec-model`. Reviewer is always Gemini (cross-family review is the design point).
-- **Round caps** — Default 2 plan + 2 code review rounds. Raise to 3 for hard features. Setting to 1 disables iteration.
-- **Mock mode** — `pipeline.py run <dir> --mock` runs with canned fake CLI responses. Zero tokens. Use after edits to prompts or state machine.
+## Recovery Playbook
 
-## Known Issues / Verified Bugs
+Organised by symptom. The state machine is the source of truth — don't edit `conversation.md` or `findings.json` to nudge the pipeline. Edit `state.json` and re-run.
 
-| # | Bug | Status |
-|---|-----|--------|
-| 1 | Prompts path incorrect (`PROMPTS_DIR = SCRIPT_DIR / "prompts"`) | **FIXED** — use `prompts/` subdir |
-| 2 | `--permission-mode acceptEdits` removed in Claude Code ≥2.1 | **FIXED** — use `--permission-mode auto` |
-| 3 | `bypassPermissions` blocked under root | **FIXED** — `auto` works with root |
-| 4 | Insufficient logging on `rc != 0` | **FIXED** — `_log_cli_failure()` writes to `<feature_dir>/cli_failures.log` |
-| 5 | Session tracking with booleans in `state.json` fragile on crashes | **REPLACED** — derive from `status.log` via `builder_has_completed_a_turn()` / `reviewer_has_completed_a_turn()` |
-| 7 | `ANTHROPIC_API_KEY` in env causes "Invalid API key" | **FIXED** — filter env dict passed to subprocess |
-| 8 | 3s stall from "no stdin data received" | **FIXED** — `stdin=subprocess.DEVNULL` when `stdin_data is None` |
-| 9 | Claude "You're out of extra usage" credit exhaustion | **DOCUMENTED** — pre-check with `claude -p "say hi"`; use `--builder-plan-model sonnet` for budget mode |
-| 10 | `--max-turns 30` insufficient for native deps | **FIXED** — `--builder-max-turns` configurable, default 120 |
-| 11 | Gemini timeout at 600s without end-marker | **DOCUMENTED** — verdict may be in `conversation.md`; manually append marker to `status.log` and resume |
-| 12 | Gemini "not running in a trusted directory" | **DOCUMENTED** — set `GEMINI_CLI_TRUST_WORKSPACE=true` when launching |
-| 13 | Gemini headless mode not writing `[Reviewer]` block to `conversation.md` | **FIXED** — `reviewer_turn_prompt()` now includes explicit write instruction for both `conversation.md` and `status.log` |
-| 14 | Notifier dies before final "DONE" notification | **DOCUMENTED** — use `setsid`/`nohup`, or have orchestrator send final notification directly |
+### Symptom: `final_status: ERROR`, `final_reason` mentions `rc=1`
 
-## Session-Existence Derivation (v2.2)
+CLI subprocess failed. Check `<feature_dir>/cli_failures.log` for stdout/stderr — it's written by `_log_cli_failure()` after every non-zero return. Common causes:
 
-**Problem:** Storing session-started booleans in `state.json` is fragile. A crash between the boolean flip and the CLI invocation leaves the state claiming a session exists that doesn't — producing `"No conversation found with session ID: ..."` on relaunch.
+- **Auth expired** — `claude login` or `gemini /auth` again.
+- **Credit exhaustion** (Anthropic) — `You're out of extra usage · resets …`. The plan in `conversation.md` is usually detailed enough to hand off, or wait for reset and resume.
+- **Network / quota** on Gemini side.
 
-**Fix:** Derive session existence from `status.log` (append-only, crash-safe):
+Recovery: fix the root cause, then patch state and resume (see "Resuming a failed run" below).
 
-```python
-def builder_has_completed_a_turn(feature_dir: Path) -> bool:
-    log = (feature_dir / "status.log").read_text()
-    return any(END_MARKERS[kind] in log for kind in [
-        "builder_plan", "builder_plan_revise",
-        "builder_exec", "builder_fix",
-    ])
+### Symptom: `reviewer subprocess failed: rc=-1 timed_out=True`
 
-def reviewer_has_completed_a_turn(feature_dir: Path) -> bool:
-    log = (feature_dir / "status.log").read_text()
-    return any(END_MARKERS[kind] in log for kind in [
-        "reviewer_plan", "reviewer_code",
-    ])
-```
+Gemini hit `GEMINI_TIMEOUT_SEC = 300` before completing. The orchestrator has a rescue path: it parses the partial stdout for a `[Reviewer]...[/Reviewer]` block via `extract_reviewer_block()` and persists it if found. If you're seeing this error in `result.json`, the rescue failed too — the review wasn't in stdout when the timeout fired.
 
-In `invoke_claude()`: use `--resume <id>` if True, else `--session-id <id>`.
-In `invoke_gemini()`: use `--resume` if True.
+Check `conversation.md` for a `[Reviewer]` block:
 
-Remove session-started fields from `State` dataclass. `load_state()` ignores unknown JSON keys, so existing `state.json` files are forward-compatible.
+- **Block exists with valid VERDICT** — the review actually completed but the orchestrator was killed mid-write. Append the marker and resume:
+  ```bash
+  echo "[Reviewer code review end]" >> "$FEATURE_DIR/status.log"
+  ```
+  Then patch `state.json` (see resuming) and re-run.
+- **No block** — the review didn't finish. Raise `GEMINI_TIMEOUT_SEC` (currently 300s in `pipeline.py`) for large codebases and resume.
 
-## Gemini trust workspace (Gemini CLI >= 0.40)
+### Symptom: `protocol violation: no [Reviewer] block found in conversation.md`
 
-If the repo has never been opened in interactive `gemini` mode, the CLI aborts with:
+**Verify before assuming a bug.** Read `conversation.md`, grep for `[Reviewer]`. If a block IS present, the validator has a bug — preserve the feature directory as evidence and report it. Do NOT contaminate by adding the block manually.
 
-```
-Gemini CLI is not running in a trusted directory.
-To proceed, either use --skip-trust, set GEMINI_CLI_TRUST_WORKSPACE=true,
-or trust this directory in interactive mode.
-```
+If genuinely missing: Gemini emitted the review to stdout but stdout was empty or malformed. Check `cli_failures.log`. The fix in v2.2 is that the reviewer prompt explicitly says *"Just print the review block to stdout"* and the orchestrator parses stdout — if you've edited `reviewer_system.md` or `reviewer_turn_prompt()` to ask Gemini to write files instead, that change broke the contract. Revert.
 
-**Fix:** Set `GEMINI_CLI_TRUST_WORKSPACE=true` in the environment when launching:
+### Symptom: `protocol violation: end-marker missing` or `no VERDICT line`
+
+Agent didn't follow protocol. One-shot only — the orchestrator does not retry on protocol violations because they usually indicate a prompt or model issue that won't fix itself.
+
+- Check the latest block in `conversation.md`. If verdict is there but missing the marker, append it manually and resume.
+- If the model genuinely went off-script, edit the prompt in `prompts/` and re-run.
+
+### Symptom: Pipeline reached ESCALATE on a round cap
+
+Default caps are 2 plan + 2 code-review rounds. Gemini, like any pedantic reviewer, will always find something — caps turn divergent loops into convergent ones. Options:
+
+- Raise the cap (`--plan-review-cap 3` / `--code-review-cap 3`) and resume — but only if recent reviewer findings look substantive, not nit-picky.
+- Hand off the half-built branch for manual finishing.
+- Abort and clean up the feature directory.
+
+### Symptom: Notifier dies before the final notification
+
+Best-effort component. If the orchestrator finished DONE but Telegram never said so, the notifier process was killed (e.g., SIGHUP from terminal closure). The orchestrator itself sends phase-transition notifications via `notify_telegram()`, so most events arrive even without the notifier — but review *summaries* (the LLM-enriched ones) come from the notifier only.
+
+**Always check `result.json` directly** — never rely solely on Telegram for completion status.
+
+### Resuming a failed run
+
+A pipeline in `ERROR` exits immediately on re-run. To resume:
+
+1. Inspect `status.log` and `cli_failures.log` to identify the last successful phase.
+2. Edit `state.json`:
+   - Set `phase` to the phase that should run next (e.g., `BUILDER_EXEC` if exec failed, `BUILDER_FIX` if a code review came back CHANGES_REQUESTED).
+   - Set `final_status` and `final_reason` to `null`.
+3. Delete `result.json` if it exists.
+4. Re-run: `python3 pipeline.py run "$FEATURE_DIR"`.
+
+The orchestrator derives Claude/Gemini session existence from `status.log` (append-only, crash-safe), so a resumed run correctly uses `--resume` for sessions that completed a turn and `--session-id` for fresh ones.
+
+---
+
+## Active Gotchas
+
+These are real failure modes you'll encounter; not bugs to fix.
+
+### Gemini "not running in a trusted directory"
+
+If the repo has never been opened in interactive `gemini` mode, the CLI aborts. The pipeline passes `--skip-trust` already, but if you see this error, you can also export:
 
 ```bash
-GEMINI_CLI_TRUST_WORKSPACE=true python3 pipeline.py run /path/to/feature_dir
+export GEMINI_CLI_TRUST_WORKSPACE=true
 ```
 
-## Credit exhaustion (Anthropic quota)
+before launching.
 
-When a Claude Code account is on a free/capped tier, Opus is expensive. A plan turn can consume enough quota that the subsequent exec turn fails with:
+### Anthropic credit exhaustion
+
+Opus is expensive. A single plan turn can exhaust a free/capped tier:
 
 ```
 You're out of extra usage · resets 7:30pm (UTC)
 ```
 
-**Mitigations:**
-- Run `claude -p "say hi"` before launching to confirm capacity.
-- For budget-constrained setups, override `--builder-plan-model sonnet`.
-- If hit mid-pipeline, the plan in `conversation.md` is usually detailed enough to hand off.
+Mitigations:
 
-## Turn budget (`--max-turns` / `builder_max_turns`)
+- Pre-flight: `claude -p "say hi"` before launching to confirm capacity.
+- Budget mode: `--builder-plan-model sonnet` (Sonnet for both plan and exec).
 
-Default: `--max-turns 120` (configurable via `--builder-max-turns`). For features requiring:
-- Installing native Node modules (e.g. `better-sqlite3`, `node-gyp`)
-- Creating 5+ new files
-- Running tests + committing
+### Turn budget
 
-30 turns may be insufficient. Symptom: `Error: Reached max turns (30)` after productive work.
+Default `--builder-max-turns 120`. Features that install native deps (`better-sqlite3`, `sharp`, anything with `node-gyp`), create 5+ files, or run a test suite can exceed 30. Symptom: `Error: Reached max turns (N) after productive work.` Bump to 150–200 for heavy features, or pre-install native deps before launching.
 
-**Mitigations:**
-- Use `--builder-max-turns 120` for features with native deps.
-- Break large features into smaller pipeline runs.
-- Pre-install native dependencies before launching.
+### Reviewer timeout on large codebases
 
-## Reviewer timeout (Gemini)
+`GEMINI_TIMEOUT_SEC = 300` in `pipeline.py`. For 15+ file reviews, Gemini may take 8+ minutes reading and writing. The rescue path (parsing partial stdout) usually saves it, but if not, raise the constant or split the feature.
 
-Gemini has `GEMINI_TIMEOUT_SEC = 600`. For large codebases (15+ files), Gemini may spend 8+ minutes reading and writing the review, then be killed before appending the end-marker to `status.log`.
+### Environment hygiene
 
-**Symptom:**
-- `result.json`: `"reviewer subprocess failed: rc=-1 timed_out=True"`
-- `conversation.md`: complete `[Reviewer]` block with `VERDICT:`
-- `status.log`: NO `[Reviewer code review end]`
+The orchestrator strips `ANTHROPIC_API_KEY` from the subprocess env so Claude Code falls back to its credentials file. If you've added other env vars that override CLI auth, filter them similarly in `_run_subprocess()` callers.
 
-**Recovery:** Manually complete the turn:
+---
 
-```bash
-echo "[Reviewer code review end]" >> <feature_dir>/status.log
+## Design contracts (don't break these)
+
+These are load-bearing. If you edit prompts or the state machine, preserve them.
+
+- **The orchestrator commits, the Builder must not.** Builder prompts say *"DO NOT commit — the orchestrator handles commits after your turn validates."* Fix turns become separate commits, not amends. Removing this from prompts breaks the audit trail.
+- **The Reviewer writes to stdout, not files.** Reviewer prompts say *"Just print the review block to stdout."* The orchestrator parses `[Reviewer]...[/Reviewer]` from stdout via `extract_reviewer_block()` and persists it itself. Asking Gemini to write `conversation.md` directly was the v2.1 design and produced bug #13.
+- **Never pipe `git diff` to Gemini via stdin.** Diff markers confuse it. The reviewer prompt tells Gemini to run `git diff` itself or read files directly. Preserve.
+- **Caps prevent divergent loops.** Setting caps to 1 disables iteration; raise to 3 only for genuinely hard features.
+- **One feature per repo at a time.** Different features running concurrently in the same project race on git operations. The `.lock` file only protects within a single feature directory.
+
+---
+
+## Configuration knobs
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--builder-plan-model` | `opus` | Plan turn model. Use `sonnet` for budget mode. |
+| `--builder-exec-model` | `sonnet` | Exec/fix turn model. |
+| `--builder-max-turns` | `120` | Per-invocation tool-call cap for Builder. |
+| `--plan-review-cap` | `2` | Plan-review rounds before ESCALATE. |
+| `--code-review-cap` | `2` | Code-review rounds before ESCALATE. |
+| `--mock` | off | Replace real CLIs with fakes. Zero tokens. |
+| `--no-notifier` | off | Don't auto-launch the notifier child process. |
+
+The Reviewer is always Gemini — cross-family review is the design point.
+
+---
+
+## File layout
+
+```
+pipeline.py              # orchestrator, CLI entry point, state machine
+notifier.py              # optional Telegram notifier (auto-launched by run)
+prompts/
+  builder_system.md      # appended to Claude's system prompt every Builder turn
+  reviewer_system.md     # prepended to Gemini's user prompt every Reviewer turn
+README.md                # developer notes (deeper than this skill)
+SKILL.md                 # this file
 ```
 
-Then patch `state.json`: set `phase` to next phase (`BUILDER_FIX` if CHANGES_REQUESTED, `MERGE_READY` if APPROVED), clear `final_status`/`final_reason`, delete `result.json`, and resume.
+Inside each project, the orchestrator creates:
 
-## Resuming a failed pipeline run
-
-If the pipeline fails mid-build (credit exhaustion, network blip, turn limit) and the root cause is fixed, resume from where it left off:
-
-```json
-// state.json
-{
-  "phase": "ERROR",
-  "final_status": "ERROR",
-  "final_reason": "builder subprocess failed: rc=1 timed_out=False"
-}
+```
+<project_root>/.hermes/features/<slug>-<short-uuid>/
+├── state.json              # session IDs, models, round counters, phase
+├── status.log              # append-only protocol log (source of truth for session existence)
+├── conversation.md         # problem statement + [Builder]/[Reviewer] blocks
+├── findings.json           # structured review verdict history
+├── result.json             # written at termination
+├── cli_failures.log        # stdout/stderr of any failed CLI invocations
+├── notifier.log            # notifier child process output
+├── notifier.pid            # pid file for cleanup
+├── .notifier_position      # tail offset (notifier resumes from here)
+└── .lock                   # advisory flock target
 ```
 
-**Do NOT** run `pipeline.py run` against this directory as-is — the state machine sees `ERROR` and exits immediately.
+One feature, one directory. Keep them around as a build archive — they're the debugging artefact.
 
-**Recovery:**
+---
 
-1. Inspect `status.log` and `cli_failures.log` to identify the last successful phase.
-2. Patch `state.json`:
-   - Set `phase` to the phase that should run next (e.g. `"BUILDER_EXEC"`).
-   - Set `final_status` and `final_reason` to `null`.
-3. Remove `result.json` if it exists.
-4. Re-run: `pipeline.py run <feature_dir>`.
+## Notifier configuration
 
-The derivation logic reads `status.log`, so a resumed run correctly uses `--resume` when a prior turn succeeded, and `--session-id` when starting fresh.
-
-**CRITICAL — Do NOT contaminate artifacts.** When a run fails with `protocol violation: no [Reviewer] block found`, first verify whether the block is actually missing (read `conversation.md`, grep for `[Reviewer]`) before concluding the validator has a bug. Archiving the contaminated feature directory preserves evidence for bug investigation.
-
-## Review block missing from conversation.md (Gemini CLI headless)
-
-**Symptom:**
-- `result.json`: `"protocol violation: no [Reviewer] block found in conversation.md"`
-- `status.log` has the end-marker
-- `conversation.md` has **zero** `[Reviewer]` occurrences
-- Gemini exited `rc=0`
-- `cli_failures.log` does not exist
-
-**Root cause:** Gemini CLI in headless mode (`-p` prompt) receives a prompt telling it to "append your review inside a `[Reviewer]...[/Reviewer]` block" but the turn prompt only gives the explicit shell command for `status.log`. The prompt does NOT give an explicit tool-write command for `conversation.md`. Gemini may emit the review to stdout (captured by `capture_output=True`), but the orchestrator ignores stdout — it only validates `conversation.md`.
-
-**Status:** Fixed in v2.2 — `reviewer_turn_prompt()` now includes explicit write instructions for both `conversation.md` and `status.log`.
-
-## Environment hygiene for subprocess calls
-
-When invoking `claude` or `gemini` from Python via `subprocess.run()`, construct a clean env dict:
-
-```python
-env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
-proc = subprocess.run(cmd, cwd=cwd, env=env, ...)
-```
-
-This prevents inherited env vars from overriding the CLI's own credentials. Also pass `stdin=subprocess.DEVNULL` when there's no piped input, to avoid the 3-second "no stdin data received" stall.
-
-## Bootstrap checklist
-
-Before first real pipeline use:
-
-```bash
-# 1. Prompts exist
-ls prompts/
-# → builder_system.md  reviewer_system.md
-
-# 2. Python syntax is valid
-python3 -c "import ast; ast.parse(open('pipeline.py').read())"
-
-# 3. Mock mode works end-to-end
-mkdir -p /tmp/pipeline-mock-test && cd /tmp/pipeline-mock-test && git init
-python3 pipeline.py setup --slug mock-test --request "Test" --project-root /tmp/pipeline-mock-test
-FEATURE_DIR=$(ls -d /tmp/pipeline-mock-test/.features/mock-test-* | head -1)
-python3 pipeline.py run "$FEATURE_DIR" --mock
-# → must end in DONE
-```
-
-## Pitfalls
-
-1. **Never pipe `git diff` to Gemini via stdin.** Gemini gets confused by diff markers and hallucinates issues. The pipeline avoids this by having the Reviewer read source files directly.
-
-2. **Round caps exist for a reason.** Gemini, like any pedantic reviewer with no memory, will always find something. The severity tags (BLOCKER/IMPORTANT/NIT) plus the round cap turn this from a divergent loop into a convergent one.
-
-3. **Don't trust "TSC OK" claims from agents.** If the project has TypeScript, verify compilation yourself after DONE: `npx tsc --noEmit`.
-
-4. **The localStorage data-loss pattern.** If the feature involves a useEffect that writes to localStorage AND another that reads on mount, the Reviewer should flag the race condition.
-
-5. **Delegate fixes to the pipeline.** When the user reports a bug or asks for a code fix, do NOT start editing files directly. Propose the pipeline first and wait for confirmation.
-
-## Notifier component (notifier.py)
-
-Optional Telegram notifier that tails `status.log` and sends real-time updates. Launch it alongside `pipeline.py run` in a separate process.
-
-### Architecture: deterministic prefix + LLM summary
-
-The notifier produces messages where **emoji + verdict are 100% deterministic** (from `findings.json`) while the **detail text is LLM-generated** (summarizing findings in Spanish).
-
-**Pattern:** Split responsibility:
-- **Python code** reads `findings.json`, extracts verdict, builds prefix (`✅ Plan APROBADO` / `⚠️ Plan CHANGES_REQUESTED`).
-- **LLM** receives only `_findings_summary(entry)` and outputs a 1-line plain-text summary.
-- **Concatenation** in Python: `f"{prefix}. {summary}"`.
-
-This pattern — *deterministic shell + LLM detail* — should be reused anywhere an LLM is asked to produce structured output where certain fields must be ground-truth accurate.
-
-### Event indexing for multi-round reviews
-
-`findings.json` accumulates a `history` array with mixed `kind` values. The notifier tracks counters per event type and filters by `kind` before indexing. Always filter by `kind` before indexing — `history[-1]` is wrong for multi-round pipelines because entries interleave plan and code reviews.
-
-### Notifier configuration
-
-The notifier reads `~/.config/pipeline/notifier.env` (mode 0600) with these variables:
+The notifier reads `~/.config/pipeline/notifier.env` (mode 0600):
 
 ```
 TELEGRAM_BOT_TOKEN_NOTIFICATIONS=<bot-token>
@@ -355,49 +345,12 @@ TELEGRAM_CHAT_ID_NOTIFICATIONS=<chat-id>
 OPENROUTER_API_KEY=<api-key>
 ```
 
-### Launching
+Note: the orchestrator itself sends phase-transition notifications via a separate `notify_telegram()` helper that reads `~/.hermes/notifier.env`. **These are two senders with two config files.** If you only configure one, you'll get partial notifications. Either symlink them or maintain both.
 
-```bash
-python3 notifier.py <feature_dir>
-```
+---
 
-Tails `status.log`, persists read offset in `.notifier_position`, and exits on terminal states (`DONE`, `ESCALATE`, `ERROR`) or inactivity timeout.
+## Why no LLM in the orchestrator
 
-### Notifier process death (missed final notification)
+The orchestrator is deterministic on purpose. Earlier iterations had an LLM drive the loop, which made every routing decision cost tokens, was nondeterministic, and resisted testing. Moving the loop to Python made the pipeline 10× faster and free to regression-test via `--mock`. The agents make intelligent calls inside their turns; the orchestrator is plumbing, not a third reviewer.
 
-**Symptom:** Pipeline finishes DONE but "Pipeline completo" message never arrives.
-
-**Root cause:** The notifier dies before the orchestrator writes the final lines (e.g., terminal closure sends SIGHUP).
-
-**Solutions:**
-1. **Orchestrator sends final notification (recommended)** — add `send_telegram` at the end of `pipeline.py` after writing `result.json`.
-2. **Daemonize the notifier** — launch with `setsid`/`nohup` instead of foreground.
-3. **Retry watcher in notifier** — after the tail loop ends, check if `result.json` exists but was not yet notified, and send before exiting.
-
-**Workaround:** Always check `result.json` directly — do not rely solely on Telegram for completion status.
-
-## File layout
-
-```
-pipeline.py              # the orchestrator
-notifier.py              # Telegram notification agent (optional)
-prompts/
-  ├── builder_system.md    # appended to Claude's system prompt every turn
-  └── reviewer_system.md   # prepended to Gemini's prompt every turn
-README.md                # developer-facing notes
-SKILL.md                 # this file
-```
-
-Inside each project, the orchestrator creates:
-
-```
-<project_root>/.features/<slug>-<short-uuid>/
-├── state.json              # session IDs, models, round counters, phase
-├── status.log              # append-only protocol log
-├── conversation.md         # problem statement + [Builder]/[Reviewer] blocks
-├── findings.json           # structured review verdict history
-├── result.json             # written at termination
-└── .lock                   # advisory lock (flock target)
-```
-
-One feature, one directory. Keep them around as a build archive.
+If you want to add LLM-driven logic to the orchestrator, stop. Add it to the agents' prompts instead.
